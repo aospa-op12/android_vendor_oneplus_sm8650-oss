@@ -19,11 +19,13 @@
  * processed by the kernel before the external-frame queue is consulted, so
  * HBP gestures keep working through the existing KEY_F4 bridge below.
  *
- * The vendor algorithm performs AFT palm/edge classification.  Its per-point
- * AFT side-palm flags are used as the primary rejection input.  A small
- * curved-edge geometry guard is retained for the case where the vendor
- * algorithm has already classified a large edge object as suspicious but has
- * not dropped it from the point package.
+ * The vendor algorithm performs AFT palm/edge classification.  Its feature
+ * thresholds come from sys_touch_algo_feature_config.xml, the same file the
+ * stock daemon feeds to IAlgoSetConfigReadCallback().  The stock HBP type-4
+ * path also runs the userspace prevention engine with the ALGO points and
+ * AFT records.  Prevention is enabled by default and only bypassed when
+ * persist.vendor.edge_grip_suppression is explicitly set to 0, which restores
+ * fully raw touch input.
  */
 
 #define LOG_TAG "OplusTouchDaemon"
@@ -58,20 +60,25 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <set>
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
 
 constexpr const char* kCoordinateNode = "/proc/touchpanel/coordinate";
 constexpr const char* kFeatureConfigName = "sys_touch_function_feature_config.xml";
+constexpr const char* kAlgoConfigName = "sys_touch_algo_feature_config.xml";
 constexpr const char* kMainRegisterNode = "/proc/touchpanel/debug_info/main_register";
 constexpr const char* kFirmwareInfoNode = "/proc/devinfo/tp";
 constexpr const char* kPipelineProperty = "persist.vendor.touch.hbp_pipeline";
+constexpr const char* kPreventionProperty = "persist.vendor.touch.hbp_prevention";
+constexpr const char* kDebugPointsProperty = "persist.vendor.touch.hbp_debug_points";
 constexpr const char* kCustomIfpProperty = "vendor.oplus.touch.customifplib.path";
 constexpr const char* kScreenStateProperty = "debug.tracing.screen_state";
 constexpr const char* kFingerprintActiveNode = "/proc/touchpanel/fingerprint_active";
@@ -168,6 +175,10 @@ std::vector<std::string> findConfigs(const char* filename) {
     add(std::string("/vendor/firmware/tp/22825/") + filename);
     add(std::string("/odm/firmware/tp/") + filename);
     add(std::string("/vendor/firmware/tp/") + filename);
+    // The stock daemon also accepts per-device overrides from the writable
+    // touchconfig directory.  Keep the packaged ODM copy as the primary
+    // source so a stale data copy cannot silently change the panel.
+    add(std::string("/data/vendor/touchconfig/") + filename);
 
     const std::string patterns[] = {
             std::string("/odm/firmware/tp/*/") + filename,
@@ -305,8 +316,45 @@ std::string resolveFirmwareFile(const std::string& directory, const std::string&
     return roots.empty() ? std::string() : roots.front() + "/" + name;
 }
 
+enum class TouchPanelVendor {
+    Unknown,
+    Boe,
+    Tianma,
+};
+
+std::string uppercase(std::string value) {
+    for (char& character : value) {
+        character = static_cast<char>(
+                std::toupper(static_cast<unsigned char>(character)));
+    }
+    return value;
+}
+
+TouchPanelVendor panelVendorFromText(const std::string& text) {
+    const std::string upper = uppercase(text);
+    if (upper.find("TIANMA") != std::string::npos) {
+        return TouchPanelVendor::Tianma;
+    }
+    if (upper.find("BOE") != std::string::npos) {
+        return TouchPanelVendor::Boe;
+    }
+    return TouchPanelVendor::Unknown;
+}
+
+const char* panelVendorName(TouchPanelVendor vendor) {
+    switch (vendor) {
+        case TouchPanelVendor::Boe:
+            return "BOE";
+        case TouchPanelVendor::Tianma:
+            return "TIANMA";
+        default:
+            return "";
+    }
+}
+
 struct FirmwarePaths {
     std::string fw_path;
+    std::string manufacture;
     std::string directory;
     std::string vendor;
     std::string hal;
@@ -322,7 +370,9 @@ FirmwarePaths resolveFirmwarePaths() {
         const std::string trimmed = trimWhitespace(line);
         if (trimmed.rfind("Device fw_path:", 0) == 0) {
             paths.fw_path = trimWhitespace(trimmed.substr(std::strlen("Device fw_path:")));
-            break;
+        } else if (trimmed.rfind("Device manufacture:", 0) == 0) {
+            paths.manufacture =
+                    trimWhitespace(trimmed.substr(std::strlen("Device manufacture:")));
         }
     }
 
@@ -335,10 +385,25 @@ FirmwarePaths resolveFirmwarePaths() {
         const size_t start = paths.fw_path.find("FW_S3910_");
         if (start != std::string::npos) {
             const size_t vendorStart = start + std::strlen("FW_S3910_");
-            const size_t vendorEnd = paths.fw_path.find("_HBP", vendorStart);
+            size_t vendorEnd = paths.fw_path.find("_HBP", vendorStart);
+            if (vendorEnd == std::string::npos) {
+                vendorEnd = paths.fw_path.find(".img", vendorStart);
+            }
             if (vendorEnd != std::string::npos) {
                 paths.vendor = paths.fw_path.substr(vendorStart, vendorEnd - vendorStart);
             }
+        }
+    }
+
+    // The HBP driver exposes the panel vendor through "Device manufacture:"
+    // (for example BOE_HBP / TIANMA_HBP).  The older fw_path-only parse is
+    // kept first for images that include the _HBP suffix, but manufacture is
+    // authoritative when fw_path is absent or does not contain a vendor.
+    if (panelVendorFromText(paths.vendor) == TouchPanelVendor::Unknown) {
+        const TouchPanelVendor manufactureVendor =
+                panelVendorFromText(paths.manufacture);
+        if (manufactureVendor != TouchPanelVendor::Unknown) {
+            paths.vendor = panelVendorName(manufactureVendor);
         }
     }
 
@@ -350,7 +415,9 @@ FirmwarePaths resolveFirmwarePaths() {
                 directory, "LIB_S3910_" + paths.vendor + "_HBP_TS_ALGO.so");
         paths.ifp = resolveFirmwareFile(directory, "libIfp.so");
     } else {
-        for (const char* vendor : {"TIANMA", "BOE"}) {
+        // This project ships BOE and TIANMA builds.  Prefer BOE when the
+        // kernel has not exposed a usable panel identifier yet.
+        for (const char* vendor : {"BOE", "TIANMA"}) {
             const std::string hal = resolveFirmwareFile(
                     directory, std::string("LIB_S3910_") + vendor + "_HBP_TS_HAL.so");
             if (access(hal.c_str(), R_OK) == 0) {
@@ -581,7 +648,9 @@ struct IfpReport {
 };
 
 // IGetAlgoPoint() package.  The point records start at offset 4 and are 0x14
-// bytes each.
+// bytes each.  The BOE implementation treats a size argument of 0xf9 or more
+// as invalid and logs the misleading "reportData is NULL" error; callers must
+// pass the 0xf8-byte payload size even though the output buffer is larger.
 struct AlgoPoint {
     uint8_t status;           // 0x00
     uint8_t reserved1;        // 0x01
@@ -597,10 +666,11 @@ struct AlgoPoint {
 };
 static_assert(sizeof(AlgoPoint) == 0x14, "AlgoPoint ABI");
 
-// IGetAftInfo() returns ten 4-byte records.  The fields are the same
-// tx_press/rx_press/tx_er/rx_er values the stock daemon feeds to the
-// prevention engine; sidePalmPressProc() sets both press values to 2 and the
-// two error values to 0xffff for a side palm.
+// IGetAftInfo() returns ten 4-byte records.  sidePalmPressProc() sets both
+// press values to 2 and both error bytes to 0xff for a side palm.  The BOE
+// implementation treats a size argument of 0x29 or more as invalid and logs
+// "size is error, aftReportData"; callers must pass the 0x28-byte payload
+// size even though the output buffer is larger.
 struct AlgoAftInfo {
     uint8_t tx_press;
     uint8_t rx_press;
@@ -617,6 +687,7 @@ using IThpAlgoInit = uint32_t (*)(void**);
 using IThpAlgoProcess = uint32_t (*)(void*);
 using IFrameDataParse = void (*)(void*, FrameDataParse*);
 using IGetAlgoPoint = uint32_t (*)(void*, void*, int);
+using IGetAlgoInsertRealPoint = uint32_t (*)(void*, void*, int);
 using IGetAftInfo = uint32_t (*)(void*, void*, int);
 using IGetAlgoInfo = uint32_t (*)(void*, int, void*, uint32_t);
 using IThpAlgoGetParam = uint32_t (*)(void*, uint32_t, uint32_t*);
@@ -637,6 +708,7 @@ struct AlgoApi {
     IThpAlgoProcess process = nullptr;
     IFrameDataParse frameParse = nullptr;
     IGetAlgoPoint getPoint = nullptr;
+    IGetAlgoInsertRealPoint getInsertRealPoint = nullptr;
     IGetAftInfo getAftInfo = nullptr;
     IGetAlgoInfo getAlgoInfo = nullptr;
     IThpAlgoGetParam getParam = nullptr;
@@ -933,15 +1005,8 @@ class TouchReporter {
 };
 
 // ---------------------------------------------------------------------------
-// Vendor prevention geometry
+// Vendor configuration helpers
 // ---------------------------------------------------------------------------
-
-struct PreventionConfig {
-    int edgeX = 600;
-    int edgeY = 600;
-    int cornerX = 2560;
-    int cornerY = 6336;
-};
 
 std::vector<int> parseCsvInts(const std::string& value) {
     std::vector<int> result;
@@ -963,73 +1028,6 @@ std::vector<int> parseCsvInts(const std::string& value) {
     return result;
 }
 
-PreventionConfig readPreventionConfig() {
-    PreventionConfig config;
-    const auto paths = findConfigs(kFeatureConfigName);
-    if (paths.empty()) {
-        return config;
-    }
-
-    tinyxml2::XMLDocument document;
-    if (document.LoadFile(paths.front().c_str()) != tinyxml2::XML_SUCCESS) {
-        return config;
-    }
-
-    std::vector<int> largeCorner;
-    std::vector<int> edgeSwipe;
-    std::vector<int> singleChannel;
-
-    for (const tinyxml2::XMLElement* module = document.RootElement();
-         module != nullptr; module = module->NextSiblingElement()) {
-        for (const tinyxml2::XMLElement* device = module->FirstChildElement("device");
-             device != nullptr; device = device->NextSiblingElement("device")) {
-            for (const tinyxml2::XMLElement* panel = device->FirstChildElement("panel");
-                 panel != nullptr; panel = panel->NextSiblingElement("panel")) {
-                for (const tinyxml2::XMLElement* modules =
-                             panel->FirstChildElement("modules");
-                     modules != nullptr; modules = modules->NextSiblingElement("modules")) {
-                    for (const tinyxml2::XMLElement* param =
-                                 modules->FirstChildElement("param");
-                         param != nullptr; param = param->NextSiblingElement("param")) {
-                        const char* name = param->Attribute("name");
-                        const tinyxml2::XMLElement* value = param->FirstChildElement("value");
-                        if (name == nullptr || value == nullptr || value->GetText() == nullptr) {
-                            continue;
-                        }
-                        const std::string text = value->GetText();
-                        if (std::strcmp(name, "prevention,large_corner_range") == 0) {
-                            largeCorner = parseCsvInts(text);
-                        } else if (std::strcmp(name, "prevention,edge_swipe_config") == 0) {
-                            edgeSwipe = parseCsvInts(text);
-                        } else if (std::strcmp(name, "prevention,single_channel_width") == 0) {
-                            singleChannel = parseCsvInts(text);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (largeCorner.size() >= 2) {
-        config.cornerX = largeCorner[0];
-        config.cornerY = largeCorner[1];
-    }
-    if (!edgeSwipe.empty()) {
-        // edge_swipe_exit_distance is how far an edge swipe may travel and
-        // still be treated as an edge gesture.  Use it as the curved-edge
-        // margin for large-object rejection.
-        config.edgeX = std::max(600, edgeSwipe.back());
-        config.edgeY = config.edgeX;
-    }
-    if (!singleChannel.empty()) {
-        config.edgeX = std::max(config.edgeX, singleChannel[0]);
-    }
-
-    LOG(INFO) << "HBP prevention geometry: edge=" << config.edgeX << "x" << config.edgeY
-              << " corner=" << config.cornerX << "x" << config.cornerY;
-    return config;
-}
-
 int readEdgeGripLevel() {
     char value[PROP_VALUE_MAX] = {};
     property_get("persist.vendor.edge_grip_suppression", value, "3");
@@ -1045,6 +1043,315 @@ int readEdgeGripLevel() {
         level = 5;
     }
     return static_cast<int>(level);
+}
+
+bool readHbpPreventionEnabled() {
+    char value[PROP_VALUE_MAX] = {};
+    // Stock initializes userspace prevention whenever the panel DTS carries
+    // kernel_grip_support, which this platform does.  Keep the property as a
+    // diagnostic override only; unset must mean enabled.
+    property_get(kPreventionProperty, value, "1");
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0;
+}
+
+bool readHbpDebugPointsEnabled() {
+    char value[PROP_VALUE_MAX] = {};
+    property_get(kDebugPointsProperty, value, "0");
+    return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Vendor THP algorithm feature configuration
+// ---------------------------------------------------------------------------
+
+struct AlgoFeaturePanel {
+    int id = -1;
+    std::string name;
+    std::map<std::string, std::vector<int>> params;
+
+    const std::vector<int>* find(const char* key) const {
+        if (key == nullptr) {
+            return nullptr;
+        }
+        const auto entry = params.find(key);
+        return entry == params.end() ? nullptr : &entry->second;
+    }
+};
+
+struct AlgoFeatureConfig {
+    std::vector<AlgoFeaturePanel> panels;
+    int selected_id = -1;
+
+    const AlgoFeaturePanel* find(int id) const {
+        for (const auto& panel : panels) {
+            if (panel.id == id) {
+                return &panel;
+            }
+        }
+        return nullptr;
+    }
+
+    const AlgoFeaturePanel* selected() const {
+        if (const AlgoFeaturePanel* panel = find(selected_id); panel != nullptr) {
+            return panel;
+        }
+        return panels.empty() ? nullptr : &panels.front();
+    }
+
+    size_t keyCount() const {
+        const AlgoFeaturePanel* panel = selected();
+        return panel == nullptr ? 0 : panel->params.size();
+    }
+};
+
+std::atomic<const AlgoFeatureConfig*> gActiveAlgoConfig{nullptr};
+
+// The stock ALGO callback serves more than the AlgoParam file.  configLoad()
+// also asks it for TouchConfig values such as palm_mode_support,
+// hbp_algo_diff_support, panel-coords, tx-rx-num, and smooth/sensitive level.
+// Merge those into the selected panel's map, keeping ALGO-specific values
+// authoritative if both files define the same key.
+void mergeTouchFeatureConfig(const std::string& panel_hint,
+                             AlgoFeatureConfig* config) {
+    if (config == nullptr) {
+        return;
+    }
+
+    const auto paths = findConfigs(kFeatureConfigName);
+    if (paths.empty()) {
+        LOG(WARNING) << "no " << kFeatureConfigName
+                     << " found; ALGO compatibility keys will use defaults";
+        return;
+    }
+
+    tinyxml2::XMLDocument document;
+    if (document.LoadFile(paths.front().c_str()) != tinyxml2::XML_SUCCESS) {
+        LOG(WARNING) << "cannot parse " << paths.front() << ": "
+                     << document.ErrorStr();
+        return;
+    }
+
+    const tinyxml2::XMLElement* root = document.RootElement();
+    if (root == nullptr) {
+        return;
+    }
+
+    const tinyxml2::XMLElement* target_panel = nullptr;
+    const tinyxml2::XMLElement* first_panel = nullptr;
+    for (const tinyxml2::XMLElement* device = root->FirstChildElement("device");
+         device != nullptr; device = device->NextSiblingElement("device")) {
+        for (const tinyxml2::XMLElement* panel = device->FirstChildElement("panel");
+             panel != nullptr; panel = panel->NextSiblingElement("panel")) {
+            if (first_panel == nullptr) {
+                first_panel = panel;
+            }
+            const char* name = panel->Attribute("name");
+            if (!panel_hint.empty() && name != nullptr &&
+                std::strstr(name, panel_hint.c_str()) != nullptr) {
+                target_panel = panel;
+            }
+        }
+    }
+    if (target_panel == nullptr) {
+        target_panel = first_panel;
+    }
+    if (target_panel == nullptr) {
+        return;
+    }
+
+    const char* target_name = target_panel->Attribute("name");
+    if (config->panels.empty()) {
+        AlgoFeaturePanel panel;
+        panel.id = target_panel->IntAttribute("id", 0);
+        if (target_name != nullptr) {
+            panel.name = target_name;
+        }
+        config->panels.push_back(std::move(panel));
+        config->selected_id = config->panels.front().id;
+    }
+
+    AlgoFeaturePanel* destination = nullptr;
+    for (auto& panel : config->panels) {
+        if (target_name != nullptr && panel.name == target_name) {
+            destination = &panel;
+            break;
+        }
+    }
+    if (destination == nullptr) {
+        for (auto& panel : config->panels) {
+            if (panel.id == config->selected_id) {
+                destination = &panel;
+                break;
+            }
+        }
+    }
+    if (destination == nullptr) {
+        destination = &config->panels.front();
+    }
+    config->selected_id = destination->id;
+
+    size_t merged = 0;
+    for (const tinyxml2::XMLElement* modules =
+                 target_panel->FirstChildElement("modules");
+         modules != nullptr; modules = modules->NextSiblingElement("modules")) {
+        for (const tinyxml2::XMLElement* param =
+                     modules->FirstChildElement("param");
+             param != nullptr; param = param->NextSiblingElement("param")) {
+            const char* name = param->Attribute("name");
+            const tinyxml2::XMLElement* value = param->FirstChildElement("value");
+            if (name == nullptr || value == nullptr || value->GetText() == nullptr) {
+                continue;
+            }
+
+            const std::vector<int> values = parseCsvInts(value->GetText());
+            if (values.empty()) {
+                continue;
+            }
+
+            const auto add = [&](const std::string& key) {
+                if (destination->params.emplace(key, values).second) {
+                    ++merged;
+                }
+            };
+
+            add(name);
+            if (std::strcmp(name, "touchpanel,smooth-level") == 0) {
+                add("smooth-level");
+            } else if (std::strcmp(name, "touchpanel,sensitive-level") == 0) {
+                add("sensitive-level");
+            } else if (std::strcmp(name, "panel-coords") == 0) {
+                add("touchpanel,panel-coords");
+            } else if (std::strcmp(name, "tx-rx-num") == 0) {
+                add("touchpanel,tx-rx-num");
+            } else if (std::strcmp(name, "grip_disable_level") == 0) {
+                add("prevention,grip_disable_level");
+            }
+            if (std::strncmp(name, "prevention,", 11) == 0) {
+                add(name + 11);
+            }
+        }
+    }
+
+    LOG(INFO) << "ALGO compatibility config: path=" << paths.front()
+              << " panel=" << (target_name != nullptr ? target_name : "<none>")
+              << " merged=" << merged
+              << " total=" << destination->params.size();
+}
+
+AlgoFeatureConfig loadAlgoFeatureConfig(const std::string& panel_hint) {
+    AlgoFeatureConfig config;
+
+    const auto paths = findConfigs(kAlgoConfigName);
+    if (paths.empty()) {
+        LOG(WARNING) << "no " << kAlgoConfigName
+                     << " found; vendor THP algorithm will use built-in defaults";
+        mergeTouchFeatureConfig(panel_hint, &config);
+        return config;
+    }
+
+    tinyxml2::XMLDocument document;
+    if (document.LoadFile(paths.front().c_str()) != tinyxml2::XML_SUCCESS) {
+        LOG(WARNING) << "cannot parse " << paths.front() << ": "
+                     << document.ErrorStr();
+        mergeTouchFeatureConfig(panel_hint, &config);
+        return config;
+    }
+
+    const tinyxml2::XMLElement* root = document.RootElement();
+    if (root == nullptr) {
+        LOG(WARNING) << paths.front() << " has no root element";
+        mergeTouchFeatureConfig(panel_hint, &config);
+        return config;
+    }
+
+    if (const tinyxml2::XMLElement* version = root->FirstChildElement("version");
+        version != nullptr && version->GetText() != nullptr) {
+        LOG(INFO) << paths.front() << " version=" << version->GetText();
+    }
+
+    int panel_order = 0;
+    for (const tinyxml2::XMLElement* device = root->FirstChildElement("device");
+         device != nullptr; device = device->NextSiblingElement("device")) {
+        for (const tinyxml2::XMLElement* panel = device->FirstChildElement("panel");
+             panel != nullptr; panel = panel->NextSiblingElement("panel")) {
+            AlgoFeaturePanel parsed;
+            parsed.id = panel->IntAttribute("id", panel_order);
+            if (const char* name = panel->Attribute("name"); name != nullptr) {
+                parsed.name = name;
+            }
+
+            // The stock callback exposes every parameter from every module
+            // in the selected panel.  Palm/AFT/anti-mistouch keys live in
+            // separate modules (Palm, AFT, FeatureEn), not only AlgoParam.
+            for (const tinyxml2::XMLElement* modules =
+                         panel->FirstChildElement("modules");
+                 modules != nullptr; modules = modules->NextSiblingElement("modules")) {
+                for (const tinyxml2::XMLElement* param =
+                             modules->FirstChildElement("param");
+                     param != nullptr; param = param->NextSiblingElement("param")) {
+                    const char* name = param->Attribute("name");
+                    const tinyxml2::XMLElement* value =
+                            param->FirstChildElement("value");
+                    if (name == nullptr || value == nullptr ||
+                        value->GetText() == nullptr) {
+                        continue;
+                    }
+
+                    std::vector<int> values = parseCsvInts(value->GetText());
+                    if (!values.empty()) {
+                        parsed.params[name] = std::move(values);
+                    }
+                }
+            }
+
+            if (!parsed.name.empty() &&
+                (!panel_hint.empty() &&
+                 parsed.name.find(panel_hint) != std::string::npos)) {
+                config.selected_id = parsed.id;
+            } else if (panel_hint.empty() && config.selected_id < 0 &&
+                       !parsed.name.empty()) {
+                config.selected_id = parsed.id;
+            }
+            config.panels.push_back(std::move(parsed));
+            ++panel_order;
+        }
+    }
+
+    if (config.selected_id < 0 && !config.panels.empty()) {
+        config.selected_id = config.panels.front().id;
+    }
+
+    mergeTouchFeatureConfig(panel_hint, &config);
+
+    const AlgoFeaturePanel* selected = config.selected();
+    LOG(INFO) << "ALGO feature config: path=" << paths.front()
+              << " panel=" << (selected != nullptr ? selected->name : "<none>")
+              << " id=" << config.selected_id
+              << " keys=" << config.keyCount();
+
+    if (selected != nullptr) {
+        if (const std::vector<int>* anti =
+                    selected->find("ANTI_MISTOUCH_ENABLE");
+            anti != nullptr && !anti->empty()) {
+            LOG(INFO) << "ALGO anti-mistouch=" << (*anti)[0];
+        }
+        if (const std::vector<int>* palm_pos = selected->find("palmPosThd");
+            palm_pos != nullptr && !palm_pos->empty()) {
+            LOG(INFO) << "ALGO palmPosThd=" << (*palm_pos)[0];
+        }
+        if (const std::vector<int>* palm_mode =
+                    selected->find("palm_mode_support");
+            palm_mode != nullptr && !palm_mode->empty()) {
+            LOG(INFO) << "ALGO palm_mode_support=" << (*palm_mode)[0];
+        }
+        if (const std::vector<int>* algo_diff =
+                    selected->find("hbp_algo_diff_support");
+            algo_diff != nullptr && !algo_diff->empty()) {
+            LOG(INFO) << "ALGO hbp_algo_diff_support=" << (*algo_diff)[0];
+        }
+    }
+
+    return config;
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,6 +1390,48 @@ class HbpPipeline {
 
         LOG(INFO) << "HBP libraries: hal=" << paths.hal << " algo=" << paths.algo
                   << " ifp=" << paths.ifp;
+        LOG(INFO) << "HBP device info: fw_path=" << paths.fw_path
+                  << " manufacture=" << paths.manufacture
+                  << " vendor=" << paths.vendor;
+
+        // The library paths are authoritative for the ABI and point layout;
+        // /proc/devinfo/tp is only the hint used to select them.
+        mPanelVendor = panelVendorFromText(paths.algo);
+        if (mPanelVendor == TouchPanelVendor::Unknown) {
+            mPanelVendor = panelVendorFromText(paths.hal);
+        }
+        if (mPanelVendor == TouchPanelVendor::Unknown) {
+            mPanelVendor = panelVendorFromText(paths.vendor);
+        }
+        if (mPanelVendor == TouchPanelVendor::Unknown) {
+            mPanelVendor = panelVendorFromText(paths.manufacture);
+        }
+        const std::string panelHint = panelVendorName(mPanelVendor);
+        LOG(INFO) << "HBP panel vendor: "
+                  << (panelHint.empty() ? "<unknown>" : panelHint);
+
+        // Stock passes sys_touch_algo_feature_config.xml to the vendor THP
+        // algorithm through IAlgoSetConfigReadCallback().  These values enable
+        // anti-mistouch and set the panel-specific palm/AFT thresholds; the
+        // library's built-in defaults are not equivalent.
+        mAlgoConfig = loadAlgoFeatureConfig(panelHint);
+        mPreventionEnabled = readHbpPreventionEnabled();
+        mDebugPoints = readHbpDebugPointsEnabled();
+
+        mPalmModeSupport = false;
+        if (const AlgoFeaturePanel* panel = mAlgoConfig.selected(); panel != nullptr) {
+            if (const std::vector<int>* palm_mode = panel->find("palm_mode_support");
+                palm_mode != nullptr && !palm_mode->empty()) {
+                mPalmModeSupport = (*palm_mode)[0] != 0;
+            }
+        }
+        char project[PROP_VALUE_MAX] = {};
+        property_get("ro.boot.prjname", project, "");
+        if (std::strncmp(project, "22851", 5) == 0) {
+            mPalmModeSupport = true;
+        }
+        LOG(INFO) << "HBP palm mode support: "
+                  << (mPalmModeSupport ? "enabled" : "disabled");
 
         // The HBP core loads this library itself when tcmInitModule() calls
         // tfpInitModule().  It must be set before the first module init.
@@ -1130,30 +1479,30 @@ class HbpPipeline {
             return false;
         }
 
-        mPrevention = readPreventionConfig();
         resetActiveState();
 
-        std::string panelHint;
-        if (paths.algo.find("TIANMA") != std::string::npos) {
-            panelHint = "TIANMA";
-        } else if (paths.algo.find("BOE") != std::string::npos) {
-            panelHint = "BOE";
-        }
-
-        const auto featureConfigs = findConfigs(kFeatureConfigName);
-        if (!featureConfigs.empty() &&
-            mTouchPrevention.start(panelHint, featureConfigs.front())) {
-            mTouchPrevention.set_makeup_callbacks(
-                    [this](int slot, uint16_t x, uint16_t y) {
-                        onMakeupPoint(slot, x, y);
-                    },
-                    [this](int slot) { onMakeupRelease(slot); });
-            mTouchPrevention.setStrength(mEdgeGripLevel);
-            LOG(INFO) << "HBP stock prevention active (panel=" << panelHint
-                      << ", level=" << mEdgeGripLevel << ")";
-        } else {
-            LOG(INFO) << "HBP stock prevention unavailable; using AFT/geometry fallback"
+        if (!mPreventionEnabled) {
+            LOG(INFO) << "HBP userspace grip prevention disabled by "
+                      << kPreventionProperty << "; reporting raw ALGO points"
                       << " (level=" << mEdgeGripLevel << ")";
+        } else {
+            const auto featureConfigs = findConfigs(kFeatureConfigName);
+            if (!featureConfigs.empty() &&
+                mTouchPrevention.start(panelHint, featureConfigs.front())) {
+                mTouchPrevention.set_makeup_callbacks(
+                        [this](int slot, uint16_t x, uint16_t y) {
+                            onMakeupPoint(slot, x, y);
+                        },
+                        [this](int slot) { onMakeupRelease(slot); });
+                mTouchPrevention.setStrength(mEdgeGripLevel);
+                LOG(INFO) << "HBP userspace grip prevention initialized (panel="
+                          << panelHint << ", level=" << mEdgeGripLevel
+                          << (mEdgeGripLevel == 0 ? ", raw input" : "") << ")";
+            } else {
+                LOG(INFO) << "HBP userspace grip prevention unavailable; "
+                             "reporting raw ALGO points (level="
+                          << mEdgeGripLevel << ")";
+            }
         }
 
         const bool initialScreenOn = screenStateIsOn();
@@ -1396,6 +1745,8 @@ class HbpPipeline {
         mAlgo.frameParse =
                 reinterpret_cast<IFrameDataParse>(dlsym(mAlgoLib, "IFrameDataParse"));
         mAlgo.getPoint = reinterpret_cast<IGetAlgoPoint>(dlsym(mAlgoLib, "IGetAlgoPoint"));
+        mAlgo.getInsertRealPoint = reinterpret_cast<IGetAlgoInsertRealPoint>(
+                dlsym(mAlgoLib, "IGetAlgoInsertRealPoint"));
         mAlgo.getAftInfo = reinterpret_cast<IGetAftInfo>(dlsym(mAlgoLib, "IGetAftInfo"));
         mAlgo.getAlgoInfo = reinterpret_cast<IGetAlgoInfo>(dlsym(mAlgoLib, "IGetAlgoInfo"));
         mAlgo.getParam = reinterpret_cast<IThpAlgoGetParam>(dlsym(mAlgoLib, "IThpAlgoGetParam"));
@@ -1423,23 +1774,69 @@ class HbpPipeline {
         return true;
     }
 
-    // The BOE algorithm invokes this while handling PARAM_ID_ALGO_CONFIG_MODE
-    // (0x11).  It currently asks only for these two keys; both default to zero
-    // in the stock XML, so return the stock defaults instead of a null table.
+    // The vendor ALGO asks for its per-panel feature thresholds through this
+    // callback while handling PARAM_ID_ALGO_CONFIG_MODE (0x11) and during
+    // later frame processing.  Serve the values from
+    // sys_touch_algo_feature_config.xml, exactly like the stock daemon.
     static int algoConfigRead(uint8_t panelIndex, const char* key, void* out, int count) {
-        (void)panelIndex;
         if (out == nullptr || key == nullptr || count <= 0) {
-            return -1;
+            return -EINVAL;
         }
+
+        (void)panelIndex;
         int* values = static_cast<int*>(out);
-        if (std::strcmp(key, "paramLogLevel") == 0 ||
-            std::strcmp(key, "prjId") == 0) {
-            for (int i = 0; i < count; ++i) {
-                values[i] = 0;
+        const AlgoFeatureConfig* config =
+                gActiveAlgoConfig.load(std::memory_order_acquire);
+        // The daemon loads exactly one panel library, so the panel selected
+        // from the resolved firmware path is authoritative.  The ALGO's
+        // requested index is only a hint.
+        const AlgoFeaturePanel* panel =
+                config != nullptr ? config->selected() : nullptr;
+
+        const std::vector<int>* configured = panel != nullptr ? panel->find(key) : nullptr;
+        if (configured == nullptr) {
+            // Keep ALGO initialization working if both XML files are absent.
+            // The real XML supplies prjId=22825 and the panel thresholds; a
+            // missing file can only fall back to the library defaults.
+            static const char* const kZeroDefaultKeys[] = {
+                    "paramLogLevel",
+                    "prjId",
+                    "is_curved_screen_v4_3",
+                    "gloveEnableSupport",
+                    "waterproofSupport",
+                    "touchZToPressureSupport",
+                    "smartTpSupport",
+                    "frame_insert_skip_frames",
+                    "edge_pull_out_support",
+                    "report_rate_white_list_support",
+                    "game_mode_divided_report_rate_support",
+                    "extreme_game_report_rate",
+                    "aiFilmSupport",
+            };
+            for (const char* default_key : kZeroDefaultKeys) {
+                if (std::strcmp(key, default_key) == 0) {
+                    // These are scalar defaults.  Never zero-fill the whole
+                    // caller buffer: the vendor passes large capacity hints
+                    // for array keys and expects the callback to stop at the
+                    // number of values actually present.
+                    values[0] = 0;
+                    return 0;
+                }
             }
-            return 0;
+            return -EINVAL;
         }
-        return -1;
+
+        // Match the stock callback: write only the values present in the XML
+        // and never exceed the caller-provided capacity.  Zero-filling to
+        // `count` corrupts the vendor stack because several array keys pass
+        // large byte-size/capacity hints (for example getGainParam() passes
+        // 0x334 for the 20-element rowGain array).
+        const int value_count =
+                std::min<int>(static_cast<int>(configured->size()), count);
+        for (int i = 0; i < value_count; ++i) {
+            values[i] = (*configured)[i];
+        }
+        return 0;
     }
 
     bool initAlgo() {
@@ -1498,9 +1895,11 @@ class HbpPipeline {
 
         bool configCallbackReady = false;
         if (mAlgo.setConfigReadCallback != nullptr) {
+            gActiveAlgoConfig.store(&mAlgoConfig, std::memory_order_release);
             result = mAlgo.setConfigReadCallback(mAlgoContext, &HbpPipeline::algoConfigRead);
             if (result != 0) {
                 LOG(WARNING) << "IAlgoSetConfigReadCallback failed: " << result;
+                gActiveAlgoConfig.store(nullptr, std::memory_order_release);
             } else {
                 configCallbackReady = true;
             }
@@ -1509,10 +1908,15 @@ class HbpPipeline {
         // PARAM_ID_ALGO_CONFIG_MODE selects the XML panel index.  On BOE this
         // call invokes algoConfigRead(), so only issue it after registration.
         if (mAlgo.setParam != nullptr && (!boePath || configCallbackReady)) {
-            const uint32_t panelIndex = boePath ? 0u : 1u;
+            uint32_t panelIndex = boePath ? 0u : 1u;
+            if (mAlgoConfig.selected_id >= 0) {
+                panelIndex = static_cast<uint32_t>(mAlgoConfig.selected_id);
+            }
             result = mAlgo.setParam(mAlgoContext, 0x11, panelIndex);
             if (static_cast<int32_t>(result) < 0) {
                 LOG(WARNING) << "IThpAlgoSetParam(0x11) failed: " << result;
+            } else {
+                LOG(INFO) << "IThpAlgoSetParam(0x11) panel index " << panelIndex;
             }
         }
 
@@ -1578,6 +1982,9 @@ class HbpPipeline {
         if (mAlgo.uninit != nullptr) {
             mAlgo.uninit(mAlgoContext);
         }
+        gActiveAlgoConfig.store(nullptr, std::memory_order_release);
+        mAlgoConfig.panels.clear();
+        mAlgoConfig.selected_id = -1;
         mAlgoContext = nullptr;
         mAlgo = {};
         if (mAlgoLib != nullptr) {
@@ -1707,10 +2114,19 @@ class HbpPipeline {
         mFrame.temperature = 25;
         mFrame.time_since_last = static_cast<uint16_t>(elapsedMs);
 
-        uint8_t pointPackage[0xf8] = {};
-        uint8_t aftPackage[sizeof(AlgoAftInfo) * kMaxPoints] = {};
+        // The BOE getters reject the full buffer sizes.  They copy only when
+        // the requested size is below the payload limit: IGetAlgoPoint()
+        // accepts < 0xf9 and IGetAftInfo() accepts < 0x29.  Pass the payload
+        // sizes (0xf8 / 0x28) and keep the larger stack buffers so the
+        // library cannot overrun them.  The error strings for the rejected
+        // sizes are misleading: "reportData is NULL" and "size is error,
+        // aftReportData" both mean the size argument was too large.
+        uint8_t pointPackage[0x100] = {};
+        uint8_t insertPackage[0x100] = {};
+        uint8_t aftPackage[0x30] = {};
         uint32_t processResult = 0;
         bool pointOk = false;
+        bool insertOk = false;
         {
             std::lock_guard<std::mutex> algoLock(mAlgoMutex);
             if (mAlgo.frameParse == nullptr || mAlgo.process == nullptr) {
@@ -1719,11 +2135,14 @@ class HbpPipeline {
             mAlgo.frameParse(mAlgoContext, &mFrame);
             processResult = mAlgo.process(mAlgoContext);
             if (processResult == 0) {
-                pointOk =
-                        mAlgo.getPoint(mAlgoContext, pointPackage, sizeof(pointPackage)) == 0;
+                pointOk = mAlgo.getPoint(mAlgoContext, pointPackage, 0xf8) == 0;
+                if (mAlgo.getInsertRealPoint != nullptr) {
+                    insertOk = mAlgo.getInsertRealPoint(
+                                       mAlgoContext, insertPackage, 0xf8) == 0;
+                }
             }
-            if (pointOk &&
-                mAlgo.getAftInfo(mAlgoContext, aftPackage, sizeof(aftPackage)) != 0) {
+            if ((pointOk || insertOk) &&
+                mAlgo.getAftInfo(mAlgoContext, aftPackage, 0x28) != 0) {
                 std::memset(aftPackage, 0, sizeof(aftPackage));
             }
         }
@@ -1733,14 +2152,15 @@ class HbpPipeline {
             clearActivePoints();
             return;
         }
-        if (!pointOk) {
+        if (!pointOk && !insertOk) {
             logPointError();
             mTouchPrevention.reset();
             clearActivePoints();
             return;
         }
 
-        buildAndReport(pointPackage, aftPackage);
+        buildAndReport(pointOk ? pointPackage : nullptr,
+                       insertOk ? insertPackage : nullptr, aftPackage);
     }
 
     struct Candidate {
@@ -1837,11 +2257,12 @@ class HbpPipeline {
         publishActivePointsLocked();
     }
 
-    // While UDFPS is active, the fingerprint HAL owns the sensor area and the
-    // stock daemon exempts fingerprint touches from the grip engine.  Read the
-    // vendor fingerprint nodes with a short cache so the event path does not
-    // open two proc files for every frame.
-    bool fingerprintBypass() {
+    // While UDFPS is active the fingerprint HAL owns the sensor area.  Stock
+    // keeps the grip engine running and does not reset it on fingerprint
+    // transitions; only a small contact inside fpSpot is exempted from the
+    // prevention result.  Read the vendor nodes with a short cache so the
+    // event path does not open two proc files for every frame.
+    bool fingerprintSessionActive() {
         const int64_t now = nowMs();
         if (now - mFingerprintCheckedMs.load() < 50) {
             return mFingerprintHalReport.load() || mFingerprintActive.load();
@@ -1853,14 +2274,62 @@ class HbpPipeline {
         const bool wasActive = mFingerprintActive.exchange(active);
         if (active != wasActive) {
             LOG(DEBUG) << "HBP fingerprint " << (active ? "active" : "inactive")
-                       << ": prevention bypass " << (active ? "on" : "off");
-            mTouchPrevention.reset();
-            resetActiveState();
+                       << ": prevention continues (UDFPS point exemption only)";
         }
         return active;
     }
 
-    void buildAndReport(const uint8_t* pointPackage, const uint8_t* aftPackage) {
+    bool isFingerprintPoint(const TouchPoint& point) const {
+        const AlgoFeaturePanel* panel = mAlgoConfig.selected();
+        if (panel == nullptr) {
+            return false;
+        }
+
+        const auto value = [panel](const char* key, int fallback) {
+            const std::vector<int>* entry = panel->find(key);
+            return entry != nullptr && !entry->empty() ? (*entry)[0] : fallback;
+        };
+
+        const int centerX = value("fpSpotCenterX", -1);
+        const int centerY = value("fpSpotCenterY", -1);
+        const int radius = value("fpSpotRadius", 0);
+        if (centerX < 0 || centerY < 0 || radius <= 0) {
+            return false;
+        }
+
+        // A palm covering the UDFPS is large; only the actual fingerprint
+        // contact should be exempted from prevention.
+        if (point.width > 10 || point.touch_major > 10) {
+            return false;
+        }
+
+        const int64_t dx = static_cast<int64_t>(point.x) - centerX;
+        const int64_t dy = static_cast<int64_t>(point.y) - centerY;
+        return dx * dx + dy * dy <=
+               static_cast<int64_t>(radius) * radius;
+    }
+
+    AlgoPoint decodeAlgoPoint(const uint8_t* pointPackage, int index) const {
+        AlgoPoint point = {};
+        const uint8_t* raw =
+                pointPackage + 4 + index * static_cast<int>(sizeof(AlgoPoint));
+        std::memcpy(&point, raw, sizeof(point));
+
+        // BOE's IGetAlgoPoint() packet is a 20-byte record whose first four
+        // bytes are a header/status word.  The TIANMA packet places the
+        // status at +0 and starts the point payload four bytes later.  x/y/id
+        // and algo_status happen to align for both, but the pressure and
+        // contact-size fields do not.
+        if (mPanelVendor == TouchPanelVendor::Boe) {
+            point.z = raw[0];
+            point.width = raw[8];
+            point.touch_major = raw[9];
+        }
+        return point;
+    }
+
+    void buildAndReport(const uint8_t* pointPackage, const uint8_t* insertPackage,
+                        const uint8_t* aftPackage) {
         const bool screenOn = mScreenOn.load();
         if (!screenOn) {
             clearActivePoints();
@@ -1868,41 +2337,61 @@ class HbpPipeline {
         }
         mScreenOn.store(true);
 
-        const bool fingerprintActive = fingerprintBypass();
+        const bool fingerprintActive = fingerprintSessionActive();
         const bool fpSession = mFingerprintHalReport.load();
 
-        std::array<TouchPreventionPoint, kMaxPoints> prevention;
-        std::array<TouchPoint, kMaxPoints> current;
-        {
-            std::lock_guard<std::mutex> lock(mActiveMutex);
-            prevention = mLastPreventionPoints;
-            current = mLastTouchPoints;
+        // Stock rebuilds both arrays from the current frame.  Starting from
+        // the previous frame keeps a disappeared palm point alive with
+        // status=1 and lets it block every later finger.
+        std::array<TouchPreventionPoint, kMaxPoints> prevention{};
+        std::array<TouchPoint, kMaxPoints> current{};
+        for (auto& point : current) {
+            point.id = -1;
         }
         uint32_t activeMask = 0;
+        uint32_t mainMask = 0;
+        uint32_t insertMask = 0;
         std::array<Candidate, kMaxPoints> candidates{};
+        std::array<bool, kMaxPoints> seen{};
         int candidateCount = 0;
+        int insertAdded = 0;
 
-        // The stock daemon indexes the prevention array and mask by the ALGO
-        // point ID, not by the package slot.  The AFT records stay indexed by
-        // the package slot because that is how IGetAftInfo orders them.
-        for (int i = 0; i < kMaxPoints; ++i) {
-            AlgoPoint point = {};
-            std::memcpy(&point, pointPackage + 4 + i * sizeof(AlgoPoint), sizeof(point));
-
-            const int id = static_cast<int>(point.id);
-            if (id < 0 || id >= kMaxPoints) {
-                continue;
+        const auto addPoint = [&](const uint8_t* package, int slot,
+                                  uint32_t& groupMask) {
+            if (package == nullptr) {
+                return;
             }
 
-            // algo_status: 1/2 are active, 3 is up, 0 is no point.
-            const bool active = (point.algo_status == 1 || point.algo_status == 2) &&
+            const AlgoPoint point = decodeAlgoPoint(package, slot);
+            const int id = static_cast<int>(point.id);
+            if (id < 0 || id >= kMaxPoints || seen[id]) {
+                return;
+            }
+
+            // Stock treats every algo status except 0 (no point) and 3 (up)
+            // as an active point; statuses 1/2 are the normal down states.
+            const bool active = point.algo_status != 0 && point.algo_status != 3 &&
                                 point.x < kAlgoMaxX && point.y < kAlgoMaxY;
             if (!active) {
-                prevention[id].status = 0;
-                continue;
+                return;
             }
 
+            seen[id] = true;
             activeMask |= (1u << id);
+            groupMask |= (1u << id);
+
+            // Stock normalizes the two contact axes before prevention and
+            // reporting.  The vendor package can place the larger axis in
+            // either field, so use min/max rather than positional names.
+            // width is one byte and touch_major is two bytes in AlgoPoint;
+            // normalize both to the byte range used by stock's report.
+            const uint16_t widthValue = point.width;
+            const uint16_t touchValue =
+                    std::min<uint16_t>(point.touch_major, 0xff);
+            const uint8_t widthMajor = static_cast<uint8_t>(
+                    std::min(widthValue, touchValue));
+            const uint8_t touchMajor = static_cast<uint8_t>(
+                    std::max(widthValue, touchValue));
 
             Candidate candidate{};
             candidate.slot = id;
@@ -1910,23 +2399,73 @@ class HbpPipeline {
             candidate.point.x = point.x;
             candidate.point.y = point.y;
             candidate.point.z = point.z;
-            candidate.point.width = point.width;
-            candidate.point.touch_major = point.touch_major;
-            std::memcpy(&candidate.aft, aftPackage + i * sizeof(AlgoAftInfo),
-                        sizeof(candidate.aft));
+            candidate.point.width = widthMajor;
+            candidate.point.touch_major = touchMajor;
+
+            // Stock indexes the AFT records by package slot, including the
+            // insert-point worker.  Only the prevention/report arrays are
+            // indexed by point ID.
+            const int aftIndex = slot;
+            if (aftPackage != nullptr && aftIndex >= 0 &&
+                aftIndex < kMaxPoints) {
+                std::memcpy(&candidate.aft,
+                            aftPackage + aftIndex * sizeof(AlgoAftInfo),
+                            sizeof(candidate.aft));
+            }
+
             current[id] = candidate.point;
             candidates[candidateCount++] = candidate;
 
             prevention[id].x = point.x;
             prevention[id].y = point.y;
             prevention[id].z = point.z;
-            prevention[id].width_major = point.width;
-            prevention[id].touch_major = point.touch_major;
+            prevention[id].width_major = widthMajor;
+            prevention[id].touch_major = touchMajor;
             prevention[id].status = 1;
             prevention[id].tx_press = candidate.aft.tx_press;
             prevention[id].rx_press = candidate.aft.rx_press;
             prevention[id].tx_er = candidate.aft.tx_er;
             prevention[id].rx_er = candidate.aft.rx_er;
+        };
+
+        // The stock daemon indexes the prevention array and mask by the ALGO
+        // point ID, not by the package slot.  The AFT records stay indexed by
+        // the package slot because that is how IGetAftInfo orders them.
+        for (int i = 0; i < kMaxPoints; ++i) {
+            addPoint(pointPackage, i, mainMask);
+        }
+
+        // Stock's insert-point worker recovers points that the palm/edge
+        // algorithm removed from the normal package.  Its
+        // IGetAlgoInsertRealPoint package uses the same 20-byte report layout.
+        // Merge new IDs before prevention so a resting palm is rejected while
+        // the new finger is still reported.
+        if (insertPackage != nullptr) {
+            const int before = candidateCount;
+            for (int i = 0; i < kMaxPoints; ++i) {
+                addPoint(insertPackage, i, insertMask);
+            }
+            insertAdded = candidateCount - before;
+        }
+
+        if (mDebugPoints) {
+            LOG(INFO) << "HBP raw mask=" << static_cast<int>(activeMask)
+                      << " points=" << candidateCount
+                      << " insert=" << insertAdded
+                      << " fp=" << (fingerprintActive ? 1 : 0);
+            for (int ci = 0; ci < candidateCount; ++ci) {
+                const Candidate& candidate = candidates[ci];
+                LOG(INFO) << "HBP point id=" << candidate.point.id
+                          << " x=" << candidate.point.x
+                          << " y=" << candidate.point.y
+                          << " z=" << candidate.point.z
+                          << " w=" << candidate.point.width
+                          << " tm=" << candidate.point.touch_major
+                          << " aft=" << static_cast<int>(candidate.aft.tx_press)
+                          << "," << static_cast<int>(candidate.aft.rx_press)
+                          << "," << static_cast<int>(candidate.aft.tx_er)
+                          << "," << static_cast<int>(candidate.aft.rx_er);
+            }
         }
 
         if (fpSession) {
@@ -1936,7 +2475,27 @@ class HbpPipeline {
             }
         }
 
-        if (mEdgeGripLevel == 0 || fingerprintActive) {
+        if (!mPreventionEnabled) {
+            // Diagnostic override only.  Stock runs prevention on the HBP
+            // type-4 path; this branch bypasses it only when the property is
+            // explicitly set to 0.
+            std::lock_guard<std::mutex> lock(mActiveMutex);
+            mLastTouchPoints = current;
+            mActiveMask = 0;
+            for (int ci = 0; ci < candidateCount; ++ci) {
+                const Candidate& candidate = candidates[ci];
+                mActivePoints[candidate.slot] = candidate.point;
+                mActiveMask |= (1u << candidate.slot);
+            }
+            publishActivePointsLocked();
+            return;
+        }
+
+        // Level 0 is an explicit request for fully raw input.  It bypasses
+        // userspace prevention even when prevention itself is enabled.
+        // Fingerprint activity must not bypass prevention: stock keeps the
+        // grip engine running and only exempts the UDFPS point itself.
+        if (mEdgeGripLevel == 0) {
             std::lock_guard<std::mutex> lock(mActiveMutex);
             mLastPreventionPoints = prevention;
             mLastTouchPoints = current;
@@ -1951,21 +2510,85 @@ class HbpPipeline {
         }
 
         if (mTouchPrevention.valid()) {
-            std::array<TouchPreventionPoint, kMaxPoints> filtered = prevention;
-            const uint32_t filteredMask =
-                    mTouchPrevention.process(prevention, activeMask, &filtered);
+            // The stock type-4 prevention call sees the normal package.  The
+            // insert-point worker runs prevention separately with only the
+            // insert package, so the palm that was rejected in the main
+            // package cannot cover the recovered finger.  Reproduce that by
+            // processing the two groups separately and merging the results.
+            std::array<TouchPreventionPoint, kMaxPoints> preventionMain =
+                    prevention;
+            std::array<TouchPreventionPoint, kMaxPoints> preventionInsert =
+                    prevention;
+            for (int i = 0; i < kMaxPoints; ++i) {
+                if ((mainMask & (1u << i)) == 0) {
+                    preventionMain[i] = TouchPreventionPoint{};
+                }
+                if ((insertMask & (1u << i)) == 0) {
+                    preventionInsert[i] = TouchPreventionPoint{};
+                }
+            }
+
+            std::array<TouchPreventionPoint, kMaxPoints> filteredMain =
+                    preventionMain;
+            std::array<TouchPreventionPoint, kMaxPoints> filteredInsert =
+                    preventionInsert;
+
+            const auto runPrevention = [&](const std::array<TouchPreventionPoint,
+                                                             kMaxPoints>& input,
+                                           uint32_t mask,
+                                           std::array<TouchPreventionPoint,
+                                                      kMaxPoints>& output,
+                                           uint32_t groupMask) {
+                uint32_t result = mask;
+                if (mask != 0) {
+                    result = mTouchPrevention.process(input, mask, &output);
+                }
+
+                // Stock keeps prevention active while UDFPS is active and
+                // exempts only the small fingerprint contact.
+                if (fingerprintActive) {
+                    for (int ci = 0; ci < candidateCount; ++ci) {
+                        const Candidate& candidate = candidates[ci];
+                        if ((groupMask & (1u << candidate.slot)) != 0 &&
+                            isFingerprintPoint(candidate.point)) {
+                            result |= (1u << candidate.slot);
+                        }
+                    }
+                }
+                return result;
+            };
+
+            const uint32_t mainOut =
+                    runPrevention(preventionMain, mainMask, filteredMain,
+                                  mainMask);
+            const uint32_t insertOut =
+                    runPrevention(preventionInsert, insertMask, filteredInsert,
+                                  insertMask);
+            const uint32_t effectiveMask = mainOut | insertOut;
+
+            if (mDebugPoints) {
+                LOG(INFO) << "HBP prevention main_in="
+                          << static_cast<int>(mainMask)
+                          << " main_out=" << static_cast<int>(mainOut)
+                          << " insert_in=" << static_cast<int>(insertMask)
+                          << " insert_out=" << static_cast<int>(insertOut)
+                          << " final=" << static_cast<int>(effectiveMask);
+            }
 
             std::lock_guard<std::mutex> lock(mActiveMutex);
             mLastPreventionPoints = prevention;
             mLastTouchPoints = current;
             mActiveMask = 0;
             for (int i = 0; i < kMaxPoints; ++i) {
-                if ((filteredMask & (1u << i)) == 0 || current[i].id < 0) {
+                if ((effectiveMask & (1u << i)) == 0 || current[i].id < 0) {
                     continue;
                 }
                 TouchPoint point = current[i];
-                point.x = filtered[i].x;
-                point.y = filtered[i].y;
+                const TouchPreventionPoint& filtered =
+                        (mainOut & (1u << i)) != 0 ? filteredMain[i]
+                                                   : filteredInsert[i];
+                point.x = filtered.x;
+                point.y = filtered.y;
                 mActivePoints[i] = point;
                 mActiveMask |= (1u << i);
             }
@@ -1973,62 +2596,19 @@ class HbpPipeline {
             return;
         }
 
-        // Fallback for an absent or unreadable prevention configuration.
-        // Keep the old AFT/geometry rejection behavior; the stock prevention
-        // engine is the primary path above.
-        const int activeCount = candidateCount;
-        std::vector<Candidate> accepted;
-        accepted.reserve(static_cast<size_t>(candidateCount));
-
-        for (int ci = 0; ci < candidateCount; ++ci) {
-            const Candidate& candidate = candidates[ci];
-            const AlgoAftInfo& aft = candidate.aft;
-            const bool palmFlag = aft.tx_er >= 0xf0 || aft.rx_er >= 0xf0;
-            const bool edgeFlag = aft.tx_er >= 0x40 || aft.rx_er >= 0x40;
-            const bool large = candidate.point.width >= 8 || candidate.point.touch_major >= 8;
-
-            const bool nearEdge =
-                    candidate.point.x < mPrevention.edgeX ||
-                    candidate.point.x + mPrevention.edgeX > kAlgoMaxX ||
-                    candidate.point.y < mPrevention.edgeY ||
-                    candidate.point.y + mPrevention.edgeY > kAlgoMaxY;
-            const bool corner =
-                    (candidate.point.x < mPrevention.cornerX ||
-                     candidate.point.x + mPrevention.cornerX > kAlgoMaxX) &&
-                    (candidate.point.y < mPrevention.cornerY ||
-                     candidate.point.y + mPrevention.cornerY > kAlgoMaxY);
-
-            bool reject = false;
-            if (palmFlag) {
-                reject = true;
-            } else if (activeCount > 1 && nearEdge && (large || edgeFlag)) {
-                reject = true;
-            } else if (activeCount > 1 && corner && large) {
-                reject = true;
-            }
-
-            if (reject) {
-                mRejectedFrames++;
-                if ((mRejectedFrames % 120) == 1) {
-                    LOG(DEBUG) << "HBP rejected point id=" << candidate.point.id
-                               << " x=" << candidate.point.x << " y=" << candidate.point.y
-                               << " w=" << candidate.point.width
-                               << " tm=" << candidate.point.touch_major
-                               << " aft=" << static_cast<int>(aft.tx_press) << ","
-                               << static_cast<int>(aft.rx_press) << ","
-                               << static_cast<int>(aft.tx_er) << ","
-                               << static_cast<int>(aft.rx_er);
-                }
-                continue;
-            }
-            accepted.push_back(candidate);
+        // Prevention was requested but its configuration could not be
+        // loaded.  Do not substitute a different heuristic: the previous
+        // AFT/geometry fallback rejected normal bottom-edge touches.  Report
+        // raw ALGO points until the stock prevention engine is available.
+        if ((mRejectedFrames++ % 600) == 0) {
+            LOG(WARNING) << "HBP prevention unavailable; reporting raw points";
         }
-
         std::lock_guard<std::mutex> lock(mActiveMutex);
         mLastPreventionPoints = prevention;
         mLastTouchPoints = current;
         mActiveMask = 0;
-        for (const auto& candidate : accepted) {
+        for (int ci = 0; ci < candidateCount; ++ci) {
+            const Candidate& candidate = candidates[ci];
             mActivePoints[candidate.slot] = candidate.point;
             mActiveMask |= (1u << candidate.slot);
         }
@@ -2155,7 +2735,7 @@ class HbpPipeline {
             }
             return false;
         }
-        if (log) {
+        if (log && mDebugPoints) {
             LOG(INFO) << "HBP fingerprint trigger " << (down ? "down" : "up")
                       << " x=" << x << " y=" << y;
         }
@@ -2341,6 +2921,50 @@ class HbpPipeline {
         return true;
     }
 
+    // Stock ts_get_palm_mode() is consulted on the screen-on path.  When the
+    // panel enables palm_mode_support, syna_hbp_main resets the vendor
+    // algorithm state (PARAM_ID 0xe) and re-applies the panel config mode.
+    // PARAM_ID 0xe is the ALGO's full data re-init path: it clears palm,
+    // report, coordinate-filter, water, and temperature state.
+    void resetAlgoForScreenOnLocked() {
+        if (mAlgo.setParam == nullptr || mAlgoContext == nullptr) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> algoLock(mAlgoMutex);
+        uint32_t result = 0;
+
+        if (mPalmModeSupport) {
+            result = mAlgo.setParam(mAlgoContext, 0xe, 1);
+            if (result != 0) {
+                LOG(WARNING) << "HBP palm-mode ALGO reset failed: " << result;
+            } else {
+                uint32_t panelIndex = 0;
+                if (mAlgoConfig.selected_id >= 0) {
+                    panelIndex =
+                            static_cast<uint32_t>(mAlgoConfig.selected_id);
+                }
+                result = mAlgo.setParam(mAlgoContext, 0x11, panelIndex);
+                if (result != 0) {
+                    LOG(WARNING) << "HBP ALGO panel reapply failed: " << result;
+                } else {
+                    LOG(INFO) << "HBP palm-mode ALGO reset, panel index "
+                              << panelIndex;
+                }
+            }
+        }
+
+        // Stock enables the insert-point mode through ts_update_custom_cfg()
+        // (PARAM_ID 0).  It lets IGetAlgoInsertRealPoint return the points the
+        // palm/edge algorithm removed from the normal package.
+        result = mAlgo.setParam(mAlgoContext, 0x0, 1);
+        if (result != 0) {
+            LOG(DEBUG) << "HBP insert mode unavailable: " << result;
+        } else {
+            LOG(INFO) << "HBP insert-point mode enabled";
+        }
+    }
+
     // Mirror the stock STATE_SCREEN_ON branch: switch the core back to mode 3
     // (enable report), then put the vendor algorithm into MODE_SCREEN_ON.
     bool enterScreenOnLocked(bool force = false) {
@@ -2376,6 +3000,7 @@ class HbpPipeline {
                 mAlgo.setMode(mAlgoContext, 1);
             }
         }
+        resetAlgoForScreenOnLocked();
         mTouchPrevention.reset();
         resetActiveState();
         mHbpSuspended.store(false);
@@ -2534,7 +3159,9 @@ class HbpPipeline {
                     break;
                 }
                 mEdgeGripLevel = edgeGripLevel;
-                mTouchPrevention.setStrength(edgeGripLevel);
+                if (mPreventionEnabled) {
+                    mTouchPrevention.setStrength(edgeGripLevel);
+                }
                 if (mHandle != nullptr && mHbpScreenOn.load() &&
                     !mHbpSuspended.load()) {
                     applyFirmwareGripLevel(edgeGripLevel);
@@ -2742,6 +3369,10 @@ class HbpPipeline {
     TcmGetHbpVersion mTcmGetHbpVersion = nullptr;
 
     AlgoApi mAlgo;
+    AlgoFeatureConfig mAlgoConfig;
+    TouchPanelVendor mPanelVendor = TouchPanelVendor::Unknown;
+    bool mPalmModeSupport = false;
+    bool mDebugPoints = false;
     void* mAlgoContext = nullptr;
 
     std::atomic<bool> mRunning{false};
@@ -2767,7 +3398,7 @@ class HbpPipeline {
     std::mutex mHalMutex;
     std::mutex mAlgoMutex;
     TouchReporter mReporter;
-    PreventionConfig mPrevention;
+    bool mPreventionEnabled = false;
     int mEdgeGripLevel = 3;
 
     std::array<TouchPreventionPoint, 10> mLastPreventionPoints = {};

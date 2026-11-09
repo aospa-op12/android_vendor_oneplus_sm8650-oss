@@ -23,13 +23,23 @@ This module replaces the prebuilt OPLUS touch AIDL service and the stock
   `libsynaHbpCore.so`, sets `vendor.oplus.touch.customifplib.path` to the stock
   `libIfp.so`, runs the stock `LIB_S3910_*_TS_ALGO.so` per-frame algorithm, and
   reports the algorithm's filtered points on the touch input device.
-- The stock daemon's userspace prevention layer is ported into the source
-  daemon: `curved_large_handle_V2`, the V4 helpers, and the make-up/up-cancel
-  path consume the vendor ALGO points and the AFT `tx_press`/`rx_press`/
-  `tx_er`/`rx_er` records.  The old AFT/geometry check is retained only as a
-  fallback when the prevention configuration cannot be loaded. The kernel
-  continues to force the Synaptics firmware grip-suppression policy as a
-  second layer.
+- `sys_touch_algo_feature_config.xml` is parsed per panel and served to the
+  vendor ALGO through `IAlgoSetConfigReadCallback()`. The TouchConfig keys
+  from `sys_touch_function_feature_config.xml` (`palm_mode_support`,
+  `hbp_algo_diff_support`, `smooth-level`, `sensitive-level`, panel geometry,
+  and the monitor/feature switches) are merged into the same map. This
+  supplies the stock anti-mistouch, palm, AFT, edge-grip, gain, and mapping
+  thresholds. Without it the vendor ALGO silently uses its built-in defaults,
+  which are not the stock touch tuning.
+- The stock HBP type-4 path reports the vendor ALGO points through the
+  userspace prevention engine. The source daemon enables that engine by
+  default, builds the prevention point array from the ALGO points and
+  `IGetAftInfo()` records, and reports the filtered points. It also merges
+  the stock `IGetAlgoInsertRealPoint()` package so fingers removed by the
+  palm/edge algorithm can still be reported. The kernel continues to force
+  the Synaptics firmware grip-suppression policy as a second layer. Set
+  `persist.vendor.edge_grip_suppression=0` for fully raw input, which bypasses
+  userspace prevention as well as firmware grip.
 - The stock `task_profiles ProcessCapacityHigh MaxPerformance` setting remains
   on the source daemon.
 - XML parsing uses the platform `libtinyxml2`. The stock
@@ -50,9 +60,17 @@ The HBP core is opened with `/dev/tcm_hbp`, which selects `/dev/tcm_hbp0` and
 enables the kernel external-frame queue. The core's custom-IFP path invokes
 `customFrameProcessor_detectObjects` from `libIfp.so`; the daemon then feeds the
 resulting `FrameDataParse` package to `IFrameDataParse()` and
-`IThpAlgoProcess()`. The point package from `IGetAlgoPoint()` and the AFT
-records from `IGetAftInfo()` are passed through the stock prevention engine
-before the filtered points are reported through the touch input device.
+`IThpAlgoProcess()`. The point package from `IGetAlgoPoint()`, the insert
+package from `IGetAlgoInsertRealPoint()`, and the AFT records from
+`IGetAftInfo()` are fed to the userspace prevention engine before the
+filtered points are reported through the touch input device. The insert
+package uses the same 20-byte report layout; new point IDs are merged before
+prevention. The BOE getters reject the full buffer lengths.
+`IGetAlgoPoint()` accepts sizes below `0xf9` and `IGetAftInfo()` accepts sizes
+below `0x29`, so the daemon passes the `0xf8` / `0x28` payload sizes while
+reserving larger stack buffers. The library's rejection messages for larger
+sizes are misleading (`reportData is NULL` and `size is error,
+aftReportData`).
 
 `REPORT_TOUCH` reports are still processed by the kernel before the external
 frame queue check, so the existing `KEY_F4` low-power gesture bridge is
@@ -63,10 +81,11 @@ path remains usable.
 ## Feature diagnostics
 
 `sys_touch_function_feature_config.xml` is parsed at startup for panel/version
-diagnostics and for the full `PreventionConfig` block used by the stock
-prevention engine. The parser selects the panel matching the resolved HBP
-library (`TIANMA` or `BOE`). The kernel driver continues to own the equivalent
-firmware/DTS values.
+diagnostics and for the stock userspace `PreventionConfig` block.
+`sys_touch_algo_feature_config.xml` is parsed for the vendor ALGO feature
+thresholds used by the normal HBP path. Both parsers select the panel matching
+the resolved HBP library (`TIANMA` or `BOE`). The kernel driver continues to
+own the equivalent firmware/DTS values.
 
 ## Runtime control
 
@@ -74,11 +93,21 @@ The HBP userspace pipeline is enabled by default. Set
 `persist.vendor.touch.hbp_pipeline=0` to leave the daemon in gesture-only mode
 and keep the kernel HBP path.
 
-`persist.vendor.edge_grip_suppression` controls both the firmware grip and the
-userspace prevention geometry. `0` disables both, `3` is the stock baseline,
-and `1-5` scale the edge/corner width using the same ratios as the firmware
+`persist.vendor.edge_grip_suppression` controls the firmware grip and the
+userspace prevention engine. `0` means fully raw input: firmware grip and
+userspace prevention are both bypassed. `3` is the stock baseline, and `1-5`
+scale the edge/corner width using the same ratios as the firmware
 negative-DARK-X levels. The source daemon reads the persistent property at
 startup and polls it from the watchdog.
+
+`persist.vendor.touch.hbp_prevention` is a diagnostic override, not a stock
+property. It defaults to enabled (`1`, or unset). Set it to `0` only to bypass
+userspace prevention while keeping firmware grip for comparison. Prevention
+is also bypassed whenever `persist.vendor.edge_grip_suppression=0`.
+
+`persist.vendor.touch.hbp_debug_points=1` logs per-frame normal and insert
+point IDs, coordinates, pressure, contact axes, AFT bytes, and prevention
+input/output masks. It is off by default and only affects logging.
 
 ## Files
 

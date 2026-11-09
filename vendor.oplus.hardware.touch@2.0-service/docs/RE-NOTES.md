@@ -144,13 +144,48 @@ The HBP AFE/ALGO pipeline:
   `IAlgoSetConfigReadCallback` before setting
   `PARAM_ID_ALGO_CONFIG_MODE (0x11)` to the XML panel index, because the BOE
   library invokes that callback while handling 0x11.
-- It feeds the ALGO points and the AFT `tx_press`/`rx_press`/`tx_er`/`rx_er`
-  records into the stock userspace prevention engine before reporting. The
-  prevention array and mask are indexed by the ALGO point ID (as in the stock
-  daemon), while the AFT records remain indexed by the package slot. The engine
-  is the same `curved_large_handle_V2`/V4 implementation used by the stock
-  daemon, including the make-up/up-cancel path. The old AFT/geometry check is
-  kept only as a fallback when the prevention configuration cannot be loaded.
+- It serves every parameter from `sys_touch_algo_feature_config.xml` to the
+  ALGO callback. The keys are spread across `AlgoParam`, `FeatureEn`, `AFT`,
+  `Palm`, and the other modules in that panel, not just `AlgoParam`. It also
+  merges the `TouchConfig` and `PreventionConfig` keys from
+  `sys_touch_function_feature_config.xml` (`palm_mode_support`,
+  `hbp_algo_diff_support`, `smooth-level`, `sensitive-level`, panel geometry,
+  grip level, and the monitor/feature switches), because stock's `configLoad`
+  asks the same callback for those keys.
+- The stock HBP type-4 path builds a 20-byte-per-point `touch_point_report`
+  and a 32-byte-per-point `point_info` array, then calls
+  `oplus_prevention_handle()` at `0x457cc`. That wrapper calls
+  `get_touch_points()` and `notify_prevention_handle()`; it is not a direct
+  `notify_prevention_handle()` call, which is why the earlier xref-only
+  analysis missed it. The source daemon runs the same prevention engine by
+  default. It indexes prevention by ALGO point ID and AFT by package slot,
+  matching stock.
+- BOE's public getters have an inverted size check: they copy only when the
+  requested size is below the payload boundary (`IGetAlgoPoint()` accepts
+  `< 0xf9`, `IGetAftInfo()` accepts `< 0x29`) and reject the full payload
+  size. The rejection messages are misleading (`reportData is NULL` and
+  `size is error, aftReportData`). The daemon reserves `0x100` and `0x30`
+  byte buffers but passes `0xf8` and `0x28`.
+- Stock also resets the vendor ALGO state on the screen-on transition when
+  `palm_mode_support=1`: `ts_get_palm_mode()` is true for this panel, and
+  `IThpAlgoSetParam(ctx, 0xe, 1)` reinitializes palm, report, coordinate
+  filter, water, and temperature state. The daemon now performs the same
+  reset, re-applies the panel config mode (`0x11`), and enables the insert
+  mode (`PARAM_ID 0`).
+- Stock type-4 signals `process_insertpt_timer` (`0x44b4c`) while the panel
+  is in the high-frame-rate reporting path. The worker calls
+  `IGetAlgoInsertRealPoint()` through ALGO table offset `+0x48`, decodes the
+  same 20-byte report layout, runs prevention, and reports the insert points.
+  The source daemon performs the equivalent merge synchronously after
+  `IThpAlgoProcess()`: every active insert ID not present in the normal
+  package is added to the current frame, and the insert group runs prevention
+  separately so the rejected palm cannot cover the recovered finger. AFT
+  records remain indexed by package slot, matching stock.
+- Fingerprint activity does not bypass prevention in stock. The previous
+  source-daemon behavior reset prevention and exempted the entire frame while
+  UDFPS was active, which let a resting palm through raw. Prevention now stays
+  active; only a small contact inside the parsed `fpSpotCenterX/Y/Radius` is
+  re-added to the output mask.
 - It reapplies the firmware grip DCs through the HBP handle when the shared
   edge-grip level changes. While the daemon owns `/dev/tcm_hbp0`, the kernel
   sysfs write can update only the stored level and cannot reliably program the
@@ -175,9 +210,11 @@ The HBP AFE/ALGO pipeline:
   fingerprint-up notifications and are caught but do not drive HBP transitions.
   This prevents screen-state changes from terminating the daemon and forcing
   init to restart it.
-- While `/proc/touchpanel/fingerprint_active` is set, prevention is bypassed so
-  a UDFPS press is not classified as a grip/palm touch. Fingerprint state is
-  polled with a short cache to avoid opening the proc node every frame.
+- While `/proc/touchpanel/fingerprint_active` is set, prevention stays active.
+  Only a small contact inside the parsed `fpSpotCenterX/Y/Radius` is exempted
+  from the prevention result so a UDFPS press is not classified as a
+  grip/palm touch. Fingerprint state is polled with a short cache to avoid
+  opening the proc node every frame.
 - Screen-on fingerprint reporting is bridged explicitly.  `REPORT_HBP_ACTIVE_FRAME`
   bypasses the kernel's normal `REPORT_TOUCH` path, so
   `syna_dev_report_fp_screen_on()` never runs while HBP owns the panel.  The
@@ -235,25 +272,41 @@ dependency at all. No touch entry needs the `_stock` workaround.
 ## Prevention port
 
 `sys_touch_function_feature_config.xml` is parsed for panel/version diagnostics
-and for the full `PreventionConfig` block used by the stock prevention engine.
-The parser selects the panel matching the resolved HBP library (`TIANMA` or
+and for the stock `PreventionConfig` block. `sys_touch_algo_feature_config.xml`
+is parsed for the vendor ALGO feature thresholds used by the normal HBP path.
+Both parsers select the panel matching the resolved HBP library (`TIANMA` or
 `BOE`). The kernel DTS continues to own the firmware equivalents; HBP firmware
 grip is applied from the kernel at the selected level, and the source daemon
 does not apply the legacy `sys_edge_touch_config.xml` values verbatim.
 
 The prevention implementation is a userspace port of the stock daemon's
 `oplus_prevention_*`, `kernel_grip_init`, `curved_large_handle_V2`, and helper
-code. It uses the ALGO `AlgoPoint` data and the AFT record fields directly;
-there is no new kernel device or ioctl. The reference binary is
-`proprietary/odm/bin/touchDaemon` from vendor commit `0b4dda3` in the
-`sm8650-common` repository.
+code. The stock binary calls the same engine from the HBP type-4 path through
+`oplus_prevention_handle()`. The daemon clears the prevention and report
+arrays every frame, because keeping a disappeared palm point with `status=1`
+blocks every later finger. It also bypasses the custom AFT/geometry fallback
+when the prevention configuration is missing; that fallback rejected normal
+bottom-edge touches, so raw ALGO points are safer until the stock engine is
+available. The reference binary is `proprietary/odm/bin/touchDaemon` from
+vendor commit `0b4dda3` in the `sm8650-common` repository.
 
-`persist.vendor.edge_grip_suppression` is the shared level for the firmware
-and userspace layers. Level `0` disables both. Levels `1-5` scale the ten
+`persist.vendor.edge_grip_suppression` controls the firmware level and the
+userspace prevention engine. Level `0` means fully raw input: both firmware
+grip and userspace prevention are bypassed. Levels `1-5` scale the ten
 edge/corner region dimensions used by `large_judge_pos()`; level `3` restores
 the stock XML geometry exactly. The scale matches the firmware DARK X ratio
 `(0x0A + 2 * (level - 1)) / 0x0E`. The daemon polls the persistent property
-from its existing watchdog and resets the prevention state when it changes.
+from its existing watchdog.
+
+`persist.vendor.touch.hbp_prevention` is a diagnostic override, not a stock
+property. It defaults to enabled (`1`, or unset). Set it to `0` only to bypass
+userspace prevention while keeping firmware grip. `edge_grip_suppression=0`
+also bypasses prevention regardless of this property.
+
+`persist.vendor.touch.hbp_debug_points=1` enables per-frame point logging:
+normal/insert counts, IDs, coordinates, pressure, contact axes, AFT bytes, and
+the prevention input/output masks. It is off by default and only affects
+logging.
 
 The source HBP node map still does not forward the legacy direction and
 reclining-mode nodes, so the prevention engine starts in the stock portrait
