@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <ctime>
+#include <iomanip>
 
 #include <algorithm>
 #include <array>
@@ -68,6 +69,10 @@ int IFingerprintCore::sendTa(std::span<uint8_t> buffer) {
     }
     const auto start = std::chrono::steady_clock::now();
     const int ret = mContext->ca()->sendCommand(buffer);
+    if (ret != 0) {
+        LOG(ERROR) << "IFingerprintCore: TA command 0x" << std::hex << readU32(buffer, 0x04)
+                   << " failed: " << std::dec << ret;
+    }
     const uint64_t durationUs = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - start)
@@ -117,13 +122,32 @@ int IFingerprintCore::init() {
         }
     }
 
-    FingerprintConfig* config = mContext->config();
-    if (config != nullptr && config->hmacKeyGate()) {
-        if (mContext->ca()->sendHmacKeyToFpta() != 0) {
-            LOG(WARNING) << "IFingerprintCore: HMAC key transfer failed";
-        }
+    const int keyRet = refreshHmacKey();
+    if (keyRet != 0) {
+        LOG(WARNING) << "IFingerprintCore: initial HMAC key transfer failed: " << keyRet;
     }
     return 0;
+}
+
+int IFingerprintCore::refreshHmacKey() {
+    if (mContext == nullptr || mContext->ca() == nullptr) {
+        LOG(ERROR) << "IFingerprintCore: cannot refresh HMAC key without TA context";
+        return -1;
+    }
+
+    FingerprintConfig* config = mContext->config();
+    if (config == nullptr || !config->hmacKeyGate()) {
+        LOG(INFO) << "IFingerprintCore: HMAC key refresh skipped (TA gate disabled)";
+        return 0;
+    }
+
+    const int ret = mContext->ca()->sendHmacKeyToFpta();
+    if (ret != 0) {
+        LOG(ERROR) << "IFingerprintCore: HMAC key refresh failed: " << ret;
+    } else {
+        LOG(INFO) << "IFingerprintCore: HMAC key refreshed before enrollment";
+    }
+    return ret;
 }
 
 int IFingerprintCore::setActiveGroup(uint32_t groupId, const char* path) {
@@ -139,9 +163,13 @@ int IFingerprintCore::setActiveGroup(uint32_t groupId, const char* path) {
     return ret;
 }
 
-int IFingerprintCore::preEnroll() {
+int IFingerprintCore::preEnroll(uint64_t* challenge) {
     auto request = makeRequest(TaCmd::PreEnroll, 0x80);
-    return sendTa(request);
+    const int ret = sendTa(request);
+    if (ret == 0 && challenge != nullptr) {
+        memcpy(challenge, request.data() + 0x78, sizeof(*challenge));
+    }
+    return ret;
 }
 
 int IFingerprintCore::enroll(const std::array<uint8_t, kHwAuthTokenSize>& token, uint32_t groupId) {

@@ -12,7 +12,6 @@
 #include "HalContext.h"
 #include "IFingerprintCore.h"
 #include "PerfTrace.h"
-#include "Utils.h"
 
 #include <aidl/android/hardware/biometrics/common/DisplayState.h>
 
@@ -284,7 +283,21 @@ int BiometricsFpSession::bindGroup() {
 
 ndk::ScopedAStatus BiometricsFpSession::generateChallenge() {
     std::lock_guard<std::mutex> lock(mMutex);
-    mChallenge = static_cast<int64_t>(Utils::getTimeUs());
+    if (mContext == nullptr || mContext->core() == nullptr) {
+        return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
+    }
+    uint64_t challenge = 0;
+    mChallenge = 0;
+    const int ret = mContext->core()->preEnroll(&challenge);
+    if (ret != 0) {
+        LOG(ERROR) << "BiometricsFpSession: PreEnroll (0x7d5) failed while generating challenge: "
+                   << ret;
+        if (mCallback != nullptr) {
+            mCallback->onError(Error::UNABLE_TO_PROCESS, 0);
+        }
+        return ndk::ScopedAStatus::ok();
+    }
+    mChallenge = static_cast<int64_t>(challenge);
     if (mCallback != nullptr) {
         mCallback->onChallengeGenerated(mChallenge);
     }
@@ -314,8 +327,44 @@ ndk::ScopedAStatus BiometricsFpSession::enroll(const HardwareAuthToken& hat,
     }
     mContext->perf().clearSetup();
     mAcceptNotifications = true;
-    core->preEnroll();
-    core->enroll(toTaAuthToken(hat), static_cast<uint32_t>(mUserId));
+    const auto token = toTaAuthToken(hat);
+    const int keyRet = core->refreshHmacKey();
+    if (keyRet != 0) {
+        LOG(ERROR) << "BiometricsFpSession: cannot refresh HMAC key before enroll: " << keyRet;
+        mAcceptNotifications = false;
+        core->setWorkMode(WorkMode::Idle);
+        setTouchReport(false);
+        if (mCallback != nullptr) {
+            mCallback->onError(Error::UNABLE_TO_PROCESS, 0);
+        }
+        return ndk::ScopedAStatus::ok();
+    }
+
+    int enrollRet = core->enroll(token, static_cast<uint32_t>(mUserId));
+    if (enrollRet == kTaInvalidHmac) {
+        LOG(WARNING) << "BiometricsFpSession: Enroll (0x7d6) rejected with invalid HMAC; "
+                        "refreshing key and retrying";
+        const int retryKeyRet = core->refreshHmacKey();
+        if (retryKeyRet == 0) {
+            enrollRet = core->enroll(token, static_cast<uint32_t>(mUserId));
+        } else {
+            LOG(ERROR) << "BiometricsFpSession: HMAC key refresh for retry failed: "
+                       << retryKeyRet;
+        }
+    }
+    if (enrollRet != 0) {
+        // Do not arm touch capture after the TA rejected the enrollment token;
+        // those later TA commands only obscure the first failure.
+        mAcceptNotifications = false;
+        core->setWorkMode(WorkMode::Idle);
+        core->enrollFinish();
+        core->cancel();
+        setTouchReport(false);
+        if (mCallback != nullptr) {
+            mCallback->onError(Error::UNABLE_TO_PROCESS, 0);
+        }
+        return ndk::ScopedAStatus::ok();
+    }
     core->setWorkMode(WorkMode::Enroll);
     setTouchReport(true);
     mContext->perf().recordSetup("enroll", elapsedUs(setupStart));

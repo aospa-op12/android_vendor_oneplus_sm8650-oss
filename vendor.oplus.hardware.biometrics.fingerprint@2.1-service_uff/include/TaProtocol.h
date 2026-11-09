@@ -72,6 +72,11 @@ enum class TaResult : int32_t {
 // Status surfaced by the transport when a command could not be delivered.
 constexpr int32_t kTaSendFailed = 0x277e;
 
+// The fingerprint TA uses this status when the HardwareAuthToken MAC does not
+// verify. Refreshing the key from keymaster and retrying the enroll command is
+// safe because the TA rejects the command before opening the enroll session.
+constexpr int32_t kTaInvalidHmac = 108;
+
 // TA config field selectors used by TaCmd::GetConfigField.
 enum class TaConfigField : uint32_t {
     FpId = 0x0a,

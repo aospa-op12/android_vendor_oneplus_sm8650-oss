@@ -47,8 +47,14 @@ class IFingerprintCore {
     // needed and forwards the HMAC key.
     virtual int init();
 
+    // Re-reads the keymaster HMAC key and forwards it to the fingerprint TA.
+    // The key can change or become available after the HAL starts during boot.
+    int refreshHmacKey();
+
     int setActiveGroup(uint32_t groupId, const char* path);
-    int preEnroll();
+    // Generates the enrollment challenge in the TA. The returned challenge
+    // must be the one exposed to the framework for its HardwareAuthToken.
+    int preEnroll(uint64_t* challenge = nullptr);
     // Opens the enroll session in the TA, carrying the framework's auth token.
     // The algorithm stays out of enroll mode until this is sent, and rejects
     // every touch until it is.
